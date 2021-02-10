@@ -3,6 +3,7 @@ package ingress
 import (
 	"context"
 	"fmt"
+	appsv1 "k8s.io/api/apps/v1"
 	"regexp"
 	"strings"
 
@@ -13,7 +14,6 @@ import (
 	retryable "github.com/openshift/cluster-ingress-operator/pkg/util/retryableerror"
 	"github.com/openshift/cluster-ingress-operator/pkg/util/slice"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/client-go/tools/record"
@@ -146,8 +146,7 @@ type Config struct {
 // reconciler handles the actual ingress reconciliation logic in response to
 // events.
 type reconciler struct {
-	config Config
-
+	config   Config
 	client   client.Client
 	cache    cache.Cache
 	recorder record.EventRecorder

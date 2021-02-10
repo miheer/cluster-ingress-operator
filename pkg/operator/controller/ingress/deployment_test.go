@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openshift/api/config/v1"
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
@@ -211,6 +212,9 @@ func TestDesiredRouterDeployment(t *testing.T) {
 			deployment.Spec.Template.Spec.Tolerations)
 	}
 
+	checkDeploymentDoesNotHaveEnvVar(t, deployment, "ERRORFILE_503")
+	checkDeploymentDoesNotHaveEnvVar(t, deployment, "ERRORFILE_404")
+
 	checkDeploymentHasEnvVar(t, deployment, "ROUTER_USE_PROXY_PROTOCOL", false, "")
 
 	checkDeploymentHasEnvVar(t, deployment, "ROUTER_CANONICAL_HOSTNAME", false, "")
@@ -319,6 +323,9 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	}
 	var expectedReplicas int32 = 8
 	ci.Spec.Replicas = &expectedReplicas
+	ci.Spec.HttpErrorCodePages = v1.ConfigMapNameReference{
+		Name: "my-custom-error-code-pages",
+	}
 	ci.Status.Domain = "example.com"
 	ci.Status.EndpointPublishingStrategy.Type = operatorv1.LoadBalancerServiceStrategyType
 	proxyNeeded, err = IsProxyProtocolNeeded(ci, infraConfig.Status.PlatformStatus)
@@ -352,6 +359,13 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	if len(deployment.Spec.Template.Spec.Containers[0].StartupProbe.Handler.HTTPGet.Host) != 0 {
 		t.Errorf("expected empty startup probe host, got %q", deployment.Spec.Template.Spec.Containers[0].StartupProbe.Handler.HTTPGet.Host)
 	}
+
+	if len(deployment.Spec.Template.Spec.Containers[0].VolumeMounts) < 3 || deployment.Spec.Template.Spec.Containers[0].VolumeMounts[3].Name != "error-pages" {
+		t.Error("router Deployment is missing error code pages volume mount")
+	}
+
+	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_503", true, "/var/lib/haproxy/conf/error_code_pages/error-page-503.http")
+	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_404", true, "/var/lib/haproxy/conf/error_code_pages/error-page-404.http")
 
 	checkDeploymentHasEnvVar(t, deployment, "ROUTER_USE_PROXY_PROTOCOL", true, "true")
 

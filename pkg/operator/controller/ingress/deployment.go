@@ -84,6 +84,7 @@ func (r *reconciler) ensureRouterDeployment(ci *operatorv1.IngressController, in
 	if err != nil {
 		return haveDepl, current, fmt.Errorf("failed to build router deployment: %v", err)
 	}
+
 	switch {
 	case !haveDepl:
 		if err := r.createRouterDeployment(desired); err != nil {
@@ -97,7 +98,6 @@ func (r *reconciler) ensureRouterDeployment(ci *operatorv1.IngressController, in
 			return r.currentRouterDeployment(ci)
 		}
 	}
-
 	return true, current, nil
 }
 
@@ -356,6 +356,34 @@ func desiredRouterDeployment(ci *operatorv1.IngressController, ingressController
 
 	volumes = append(volumes, certsVolume)
 	routerVolumeMounts = append(routerVolumeMounts, certsVolumeMount)
+
+	if len(ci.Spec.HttpErrorCodePages.Name) != 0 {
+		configmapName := controller.HttpErrorCodePageConfigMapName(ci)
+		httpErrorCodeConfigVolume := corev1.Volume{
+			Name: "error-pages",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: configmapName.Name,
+					},
+				},
+			},
+		}
+		volumes = append(volumes, httpErrorCodeConfigVolume)
+		httpErrorCodeVolumeMount := corev1.VolumeMount{
+			Name:      httpErrorCodeConfigVolume.Name,
+			MountPath: "/var/lib/haproxy/conf/error_code_pages",
+		}
+		routerVolumeMounts = append(routerVolumeMounts, httpErrorCodeVolumeMount)
+		env = append(env, corev1.EnvVar{
+			Name:  "ERRORFILE_503",
+			Value: "/var/lib/haproxy/conf/error_code_pages/error-page-503.http",
+		})
+		env = append(env, corev1.EnvVar{
+			Name:  "ERRORFILE_404",
+			Value: "/var/lib/haproxy/conf/error_code_pages/error-page-404.http",
+		})
+	}
 
 	env = append(env, corev1.EnvVar{Name: "ROUTER_METRICS_TYPE", Value: "haproxy"})
 	env = append(env, corev1.EnvVar{Name: "ROUTER_METRICS_TLS_CERT_FILE", Value: filepath.Join(certsVolumeMountPath, "tls.crt")})
