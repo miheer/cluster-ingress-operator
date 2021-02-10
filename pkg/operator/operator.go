@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	sync_http_error_code_configmap "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/sync-http-error-code-configmap"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -67,6 +68,8 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 			operatorcontroller.DefaultCanaryNamespace,
 			operatorcontroller.GlobalMachineSpecifiedConfigNamespace,
 			"",
+			operatorcontroller.DefaultOperandNamespace,
+			operatorcontroller.SourceConfigMapNamespace,
 		}),
 		// Use a non-caching client everywhere. The default split client does not
 		// promise to invalidate the cache during writes (nor does it promise
@@ -87,7 +90,7 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 	if _, err := ingresscontroller.New(mgr, ingresscontroller.Config{
 		Namespace:              config.Namespace,
 		IngressControllerImage: config.IngressControllerImage,
-	}); err != nil {
+	}, operatorcontroller.DefaultOperandNamespace, operatorcontroller.SourceConfigMapNamespace); err != nil {
 		return nil, fmt.Errorf("failed to create ingress controller: %v", err)
 	}
 
@@ -111,6 +114,10 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 	// Set up the certificate controller
 	if _, err := certcontroller.New(mgr, config.Namespace); err != nil {
 		return nil, fmt.Errorf("failed to create cacert controller: %v", err)
+	}
+
+	if _, err := sync_http_error_code_configmap.New(mgr, config.Namespace, "openshift-config", "openshift-ingress"); err != nil {
+		return nil, fmt.Errorf("failed to create sync_http_error_code_configmap controller: %v", err)
 	}
 
 	// Set up the certificate-publisher controller
