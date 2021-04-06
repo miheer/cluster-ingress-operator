@@ -1,8 +1,3 @@
-// The sync_http_error_code_configmap_controller is responsible for:
-//
-//   1. Synchronize the configmaps created for custom error code pages between
-//  admin created config in openshift-config namespace and openshift-ingress namespace
-//   3. Publishing the CA to `openshift-config-managed`
 package sync_http_error_code_configmap
 
 import (
@@ -13,7 +8,6 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	logf "github.com/openshift/cluster-ingress-operator/pkg/log"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
-	ingresscontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -36,68 +29,84 @@ import (
 )
 
 const (
-	controllerName = "sync_http_error_code_configmap_controller"
+	controllerName = "error_page_configmap_controller"
 )
 
 var log = logf.Logger.WithName(controllerName)
 
-func New(mgr manager.Manager, operatorNamespace string, operandNamespace string, sourceConfigMapNamespace string) (runtimecontroller.Controller, error) {
+// New creates a new controller that syncs HTTP error page configmaps between
+// namespaces.
+func New(mgr manager.Manager, config Config) (runtimecontroller.Controller, error) {
 	operatorCache := mgr.GetCache()
 	reconciler := &reconciler{
-		client:                   mgr.GetClient(),
-		cache:                    operatorCache,
-		recorder:                 mgr.GetEventRecorderFor(controllerName),
-		operatorNamespace:        operatorNamespace,
-		operandNamespace:         operandNamespace,
-		sourceConfigMapNamespace: sourceConfigMapNamespace,
+		cache:    operatorCache,
+		client:   mgr.GetClient(),
+		config:   config,
+		recorder: mgr.GetEventRecorderFor(controllerName),
 	}
 	c, err := runtimecontroller.New(controllerName, mgr, runtimecontroller.Options{Reconciler: reconciler})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := c.Watch(&source.Kind{Type: &operatorv1.IngressController{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	// If the ingresscontroller's error-page configmap reference changes,
+	// reconcile the ingresscontroller.
+	if err := c.Watch(&source.Kind{Type: &operatorv1.IngressController{}}, &handler.EnqueueRequestForObject{}, predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return reconciler.hasConfigMap(e.Object) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return reconciler.hasConfigMap(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return reconciler.configMapChanged(e.ObjectOld, e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return reconciler.hasConfigMap(e.Object) },
+	}); err != nil {
 		return nil, err
 	}
 
-	// Index ingresscontrollers over the httpErrorCodePage name so that
-	// configMapIsInUse and configMapToIngressController can look up
-	// ingresscontrollers that reference the secret.
-	if err := operatorCache.IndexField(context.Background(), &operatorv1.IngressController{}, "httpErrorCodePages", func(o client.Object) []string {
-		configmapInOpenShiftConfig := controller.HttpErrorCodePageConfigMapName(o.(*operatorv1.IngressController), sourceConfigMapNamespace)
-		configmapInOpenShiftIngress := controller.HttpErrorCodePageConfigMapName(o.(*operatorv1.IngressController), operandNamespace)
-		return []string{configmapInOpenShiftConfig.Name, configmapInOpenShiftIngress.Name}
-	}); err != nil {
-		return nil, fmt.Errorf("failed to create index for ingresscontroller: %v", err)
+	// Index ingresscontrollers by spec.httpErrorCodePages.name so that
+	// configmapToIngressController and configmapIsInUse can look up
+	// ingresscontrollers that reference the configmap.
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &operatorv1.IngressController{}, "spec.httpErrorCodePages.name", client.IndexerFunc(func(o client.Object) []string {
+		ic := o.(*operatorv1.IngressController)
+		return []string{ic.Spec.HttpErrorCodePages.Name}
+	})); err != nil {
+		return nil, fmt.Errorf("failed to create index for ingresscontroller: %w", err)
 	}
 
-	configmapsInformerForOpenShiftConfigAndOpenShiftIngress, err := operatorCache.GetInformer(context.Background(), &corev1.ConfigMap{})
+	configmapsInformer, err := operatorCache.GetInformer(context.Background(), &corev1.ConfigMap{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create informer for configMap: %v", err)
+		return nil, fmt.Errorf("failed to get informer for configmaps: %w", err)
 	}
-	if err := c.Watch(&source.Informer{Informer: configmapsInformerForOpenShiftConfigAndOpenShiftIngress}, handler.EnqueueRequestsFromMapFunc(reconciler.configmapToIngressController), predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-		UpdateFunc:  func(e event.UpdateEvent) bool { return reconciler.configmapIsInUse(e.ObjectNew) },
-		GenericFunc: func(e event.GenericEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-	}); err != nil {
+	// If a configmap in the source namespace that is referenced by an
+	// ingresscontroller changes, reconcile the ingresscontroller.
+	if err := c.Watch(&source.Informer{Informer: configmapsInformer}, handler.EnqueueRequestsFromMapFunc(reconciler.configmapToIngressController), predicate.NewPredicateFuncs(reconciler.configmapIsInUse)); err != nil {
+		return nil, err
+	}
+
+	// If a configmap in the destination (operand) namespace that is used by
+	// an ingresscontroller's deployment changes, reconcile the
+	// ingresscontroller.
+	if err := c.Watch(&source.Informer{Informer: configmapsInformer}, &handler.EnqueueRequestForOwner{OwnerType: &operatorv1.IngressController{}}); err != nil {
 		return nil, err
 	}
 
 	return c, nil
 }
 
-type reconciler struct {
-	client                   client.Client
-	recorder                 record.EventRecorder
-	operatorNamespace        string
-	cache                    cache.Cache
-	operandNamespace         string
-	sourceConfigMapNamespace string
+// Config holds all the things necessary for the controller to run.
+type Config struct {
+	OperatorNamespace    string
+	SourceNamespace      string
+	DestinationNamespace string
 }
 
-// configmapToIngressController maps a configmap to a slice of reconcile requests,
-// one request per ingresscontroller that references the configmap.
+type reconciler struct {
+	cache    cache.Cache
+	client   client.Client
+	config   Config
+	recorder record.EventRecorder
+}
+
+// configmapToIngressController maps a configmap to a slice of reconcile
+// requests, one request per ingresscontroller that references the configmap for
+// custom error pages.
 func (r *reconciler) configmapToIngressController(o client.Object) []reconcile.Request {
 	requests := []reconcile.Request{}
 	controllers, err := r.ingressControllersWithConfigMap(o.GetName())
@@ -119,114 +128,76 @@ func (r *reconciler) configmapToIngressController(o client.Object) []reconcile.R
 }
 
 // ingressControllersWithConfigMap returns the ingresscontrollers that reference
-// the given configmap.
+// the given configmap for custom error pages.
 func (r *reconciler) ingressControllersWithConfigMap(configmapName string) ([]operatorv1.IngressController, error) {
 	controllers := &operatorv1.IngressControllerList{}
-	if err := r.cache.List(context.Background(), controllers); err != nil {
+	if err := r.cache.List(context.Background(), controllers, client.MatchingFields{"spec.httpErrorCodePages.name": configmapName}); err != nil {
 		return nil, err
 	}
 	return controllers.Items, nil
 }
 
-// configmapIsInUse returns true if the given configmap is referenced by some
-// ingresscontroller.
-func (r *reconciler) configmapIsInUse(meta metav1.Object) bool {
-	controllers, err := r.ingressControllersWithConfigMap(meta.GetName())
+// configmapIsInUse returns true if the given configmap is used for custom error
+// pages by some ingresscontroller.
+func (r *reconciler) configmapIsInUse(o client.Object) bool {
+	controllers, err := r.ingressControllersWithConfigMap(o.GetName())
 	if err != nil {
-		log.Error(err, "failed to list ingresscontrollers for configmap", "related", meta.GetSelfLink())
+		log.Error(err, "failed to list ingresscontrollers for configmap", "related", o.GetSelfLink())
 		return false
 	}
 	return len(controllers) > 0
 }
 
-// hasConfigMap returns true if the effective  httpErrorCodePage configmap for the
-// given ingresscontroller exists, false otherwise.
-func (r *reconciler) hasConfigMap(meta metav1.Object, o runtime.Object) bool {
+// hasConfigMap returns true if the given ingresscontroller specifies a
+// configmap for custom error pages, false otherwise.
+func (r *reconciler) hasConfigMap(o client.Object) bool {
 	ic := o.(*operatorv1.IngressController)
-	configMapName := controller.HttpErrorCodePageConfigMapName(ic, r.operandNamespace)
-	configMap := &corev1.ConfigMap{}
-	if err := r.client.Get(context.Background(), configMapName, configMap); err != nil {
-		if errors.IsNotFound(err) {
-			return false
-		}
-		log.Error(err, "failed to look up configmap for ingresscontroller", "name", configMapName, "related", meta.GetSelfLink())
-	}
-	return true
+	return len(ic.Spec.HttpErrorCodePages.Name) != 0
 }
 
-// configMapChanged returns true if the name of config
-// for the given ingresscontroller has changed, false
-// otherwise.
-// TODO check the data between old and new configmaps
+// configMapChanged returns true if the name of configmap that the given
+// ingresscontroller uses for custom error pages has changed, false otherwise.
 func (r *reconciler) configMapChanged(old, new runtime.Object) bool {
 	oldController := old.(*operatorv1.IngressController)
 	newController := new.(*operatorv1.IngressController)
-	oldConfigMap := controller.HttpErrorCodePageConfigMapName(oldController, r.sourceConfigMapNamespace)
-	newConfigMap := controller.HttpErrorCodePageConfigMapName(newController, r.sourceConfigMapNamespace)
-	oldStatus := oldController.Spec.HttpErrorCodePages.Name
-	newStatus := newController.Spec.HttpErrorCodePages.Name
-	return oldConfigMap != newConfigMap || oldStatus != newStatus
+	oldName := oldController.Spec.HttpErrorCodePages.Name
+	newName := newController.Spec.HttpErrorCodePages.Name
+	return oldName != newName
 }
 
+// Reconcile reconciles an ingresscontroller and its associated error-page
+// configmap, if it specifies one.
 func (r *reconciler) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
-	result := reconcile.Result{}
-	errs := []error{}
 	ingress := &operatorv1.IngressController{}
-	if err := r.client.Get(context.TODO(), request.NamespacedName, ingress); err != nil {
+	if err := r.client.Get(ctx, request.NamespacedName, ingress); err != nil {
 		if errors.IsNotFound(err) {
-			// The ingress could have been deleted and we're processing a stale queue
-			// item, so ignore and skip.
 			log.Info("ingresscontroller not found; reconciliation will be skipped", "request", request)
-		} else {
-			errs = append(errs, fmt.Errorf("failed to get ingresscontroller: %v", err))
+			return reconcile.Result{}, nil
 		}
-	} else if !ingresscontroller.IsStatusDomainSet(ingress) {
-		log.Info("ingresscontroller domain not set; reconciliation will be skipped", "request", request)
-	} else {
-		deployment := &appsv1.Deployment{}
-		err = r.client.Get(context.TODO(), controller.RouterDeploymentName(ingress), deployment)
-		if err != nil {
-			if errors.IsNotFound(err) {
-				// All ingresses should have a deployment, so this one may not have been
-				// created yet. Retry after a reasonable amount of time.
-				log.Info("deployment not found; will retry default cert sync", "ingresscontroller", ingress.Name)
-				result.RequeueAfter = 5 * time.Second
-			} else {
-				errs = append(errs, fmt.Errorf("failed to get deployment: %v", err))
-			}
-		} else {
-			trueVar := true
-			deploymentRef := metav1.OwnerReference{
-				APIVersion: "apps/v1",
-				Kind:       "Deployment",
-				Name:       deployment.Name,
-				UID:        deployment.UID,
-				Controller: &trueVar,
-			}
-			controllers := &operatorv1.IngressControllerList{}
-			if err := r.cache.List(context.TODO(), controllers, client.InNamespace(r.operatorNamespace)); err != nil {
-				return reconcile.Result{}, fmt.Errorf("failed to list ingresscontrollers: %v", err)
-			}
-			for _, ingresscontroller := range controllers.Items {
-				if _, _, err := r.ensureHttpErrorCodeConfigMap(&ingresscontroller, deploymentRef); err != nil {
-					errs = append(errs, fmt.Errorf("failed to ensure default cert for %s: %v", ingress.Name, err))
-				}
-			}
-		}
+		return reconcile.Result{}, fmt.Errorf("failed to get ingresscontroller: %w", err)
 	}
-	return result, utilerrors.NewAggregate(errs)
-}
-
-// CurrentHttpErrorCodeConfigMap returns the current configmap.  Returns a
-// Boolean indicating whether the configmap existed, the configmap if it did
-// exist, and an error value.
-func (r *reconciler) currentHttpErrorCodeConfigMap(ic *operatorv1.IngressController, namespace string) (bool, *corev1.ConfigMap, error) {
-	cm := &corev1.ConfigMap{}
-	if err := r.client.Get(context.TODO(), controller.HttpErrorCodePageConfigMapName(ic, namespace), cm); err != nil {
+	deployment := &appsv1.Deployment{}
+	if err := r.client.Get(ctx, controller.RouterDeploymentName(ingress), deployment); err != nil {
 		if errors.IsNotFound(err) {
-			return false, nil, nil
+			log.Info("deployment not found; will retry configmap sync", "ingresscontroller", ingress.Name)
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		return false, nil, err
+		return reconcile.Result{}, fmt.Errorf("failed to get deployment: %w", err)
 	}
-	return true, cm, nil
+	trueVar := true
+	deploymentRef := metav1.OwnerReference{
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Kind:       "Deployment",
+		Name:       deployment.Name,
+		UID:        deployment.UID,
+		Controller: &trueVar,
+	}
+	controllers := &operatorv1.IngressControllerList{}
+	if err := r.cache.List(ctx, controllers, client.InNamespace(r.config.OperatorNamespace)); err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to list ingresscontrollers: %w", err)
+	}
+	if _, _, err := r.ensureHttpErrorCodeConfigMap(ingress, deploymentRef); err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to ensure errorpage configmap for ingresscontroller %q: %w", ingress.Name, err)
+	}
+	return reconcile.Result{}, nil
 }

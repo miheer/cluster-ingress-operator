@@ -121,9 +121,6 @@ func TestDesiredRouterDeployment(t *testing.T) {
 			Name: "default",
 		},
 		Spec: operatorv1.IngressControllerSpec{
-			HttpErrorCodePages: v1.ConfigMapNameReference{
-				Name: "my-custom-error-code-pages",
-			},
 			NamespaceSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"foo": "bar",
@@ -179,7 +176,7 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to determine infrastructure platform status for ingresscontroller %s/%s: %v", ci.Namespace, ci.Name, err)
 	}
-	deployment, err := desiredRouterDeployment(true, ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
+	deployment, err := desiredRouterDeployment(ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
 	if err != nil {
 		t.Errorf("invalid router Deployment: %v", err)
 	}
@@ -191,18 +188,6 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	} else if actualHash != expectedHash {
 		t.Errorf("router Deployment has wrong hash; expected: %s, got: %s", expectedHash, actualHash)
 	}
-
-	if (deployment.Spec.Template.Spec.Containers[0].VolumeMounts[3] != corev1.VolumeMount{
-		Name:      "httperrorcodeconfigmap-volume-my-custom-error-code-pages",
-		MountPath: "/var/lib/haproxy/conf/error_code_pages",
-		SubPath:   "",
-		ReadOnly:  false,
-	}) {
-		t.Error("router Deployment is missing error code pages volume mount")
-	}
-
-	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_503", true, "/var/lib/haproxy/conf/error_code_pages/error-page-503.http")
-	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_404", true, "/var/lib/haproxy/conf/error_code_pages/error-page-404.http")
 
 	checkDeploymentHasEnvVar(t, deployment, WildcardRouteAdmissionPolicy, true, "false")
 
@@ -226,6 +211,9 @@ func TestDesiredRouterDeployment(t *testing.T) {
 		t.Errorf("router Deployment has unexpected toleration: %#v",
 			deployment.Spec.Template.Spec.Tolerations)
 	}
+
+	checkDeploymentDoesNotHaveEnvVar(t, deployment, "ERRORFILE_503")
+	checkDeploymentDoesNotHaveEnvVar(t, deployment, "ERRORFILE_404")
 
 	checkDeploymentHasEnvVar(t, deployment, "ROUTER_USE_PROXY_PROTOCOL", false, "")
 
@@ -335,13 +323,16 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	}
 	var expectedReplicas int32 = 8
 	ci.Spec.Replicas = &expectedReplicas
+	ci.Spec.HttpErrorCodePages = v1.ConfigMapNameReference{
+		Name: "my-custom-error-code-pages",
+	}
 	ci.Status.Domain = "example.com"
 	ci.Status.EndpointPublishingStrategy.Type = operatorv1.LoadBalancerServiceStrategyType
 	proxyNeeded, err = IsProxyProtocolNeeded(ci, infraConfig.Status.PlatformStatus)
 	if err != nil {
 		t.Errorf("failed to determine infrastructure platform status for ingresscontroller %s/%s: %v", ci.Namespace, ci.Name, err)
 	}
-	deployment, err = desiredRouterDeployment(false, ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
+	deployment, err = desiredRouterDeployment(ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
 	if err != nil {
 		t.Errorf("invalid router Deployment: %v", err)
 	}
@@ -368,6 +359,13 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	if len(deployment.Spec.Template.Spec.Containers[0].StartupProbe.Handler.HTTPGet.Host) != 0 {
 		t.Errorf("expected empty startup probe host, got %q", deployment.Spec.Template.Spec.Containers[0].StartupProbe.Handler.HTTPGet.Host)
 	}
+
+	if len(deployment.Spec.Template.Spec.Containers[0].VolumeMounts) < 3 || deployment.Spec.Template.Spec.Containers[0].VolumeMounts[3].Name != "error-pages" {
+		t.Error("router Deployment is missing error code pages volume mount")
+	}
+
+	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_503", true, "/var/lib/haproxy/conf/error_code_pages/error-page-503.http")
+	checkDeploymentHasEnvVar(t, deployment, "ERRORFILE_404", true, "/var/lib/haproxy/conf/error_code_pages/error-page-404.http")
 
 	checkDeploymentHasEnvVar(t, deployment, "ROUTER_USE_PROXY_PROTOCOL", true, "true")
 
@@ -410,7 +408,7 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to determine infrastructure platform status for ingresscontroller %s/%s: %v", ci.Namespace, ci.Name, err)
 	}
-	deployment, err = desiredRouterDeployment(false, ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
+	deployment, err = desiredRouterDeployment(ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
 	if err != nil {
 		t.Errorf("invalid router Deployment: %v", err)
 	}
@@ -497,7 +495,7 @@ func TestDesiredRouterDeployment(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to determine infrastructure platform status for ingresscontroller %s/%s: %v", ci.Namespace, ci.Name, err)
 	}
-	deployment, err = desiredRouterDeployment(false, ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
+	deployment, err = desiredRouterDeployment(ci, ingressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
 	if err != nil {
 		t.Errorf("invalid router Deployment: %v", err)
 	}

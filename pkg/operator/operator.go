@@ -90,7 +90,7 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 	if _, err := ingresscontroller.New(mgr, ingresscontroller.Config{
 		Namespace:              config.Namespace,
 		IngressControllerImage: config.IngressControllerImage,
-	}, operatorcontroller.DefaultOperandNamespace, operatorcontroller.SourceConfigMapNamespace); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("failed to create ingress controller: %v", err)
 	}
 
@@ -116,8 +116,13 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 		return nil, fmt.Errorf("failed to create cacert controller: %v", err)
 	}
 
-	if _, err := sync_http_error_code_configmap.New(mgr, config.Namespace, "openshift-config", "openshift-ingress"); err != nil {
-		return nil, fmt.Errorf("failed to create sync_http_error_code_configmap controller: %v", err)
+	// Set up the error-page configmap controller.
+	if _, err := sync_http_error_code_configmap.New(mgr, sync_http_error_code_configmap.Config{
+		OperatorNamespace:    config.Namespace,
+		SourceNamespace:      operatorcontroller.GlobalUserSpecifiedConfigNamespace,
+		DestinationNamespace: operatorcontroller.DefaultOperandNamespace,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to create error-page configmap controller: %w", err)
 	}
 
 	// Set up the certificate-publisher controller

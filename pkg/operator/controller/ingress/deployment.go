@@ -80,23 +80,11 @@ func (r *reconciler) ensureRouterDeployment(ci *operatorv1.IngressController, in
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to determine if proxy protocol is needed for ingresscontroller %s/%s: %v", ci.Namespace, ci.Name, err)
 	}
-	if len(ci.Spec.HttpErrorCodePages.Name) != 0 {
-		haveErrorCodeCMInOpenShiftIngress, _, err := r.currentHttpErrorCodeConfigMap(ci, "openshift-ingress")
-		if err != nil {
-			return false, nil, fmt.Errorf("failed to determine configmap in openshift-ingress namespace %s/%s: %v", ci.Namespace, ci.Name, err)
-		}
-		desired, err := desiredRouterDeployment(haveErrorCodeCMInOpenShiftIngress, ci, r.config.IngressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
-		return r.verifyCreateOrUpdateRouterDeployment(haveDepl, current, desired, ci)
-	} else {
-		desired, err := desiredRouterDeployment(false, ci, r.config.IngressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
-		if err != nil {
-			return haveDepl, current, fmt.Errorf("failed to build router deployment: %v", err)
-		}
-		return r.verifyCreateOrUpdateRouterDeployment(haveDepl, current, desired, ci)
+	desired, err := desiredRouterDeployment(ci, r.config.IngressControllerImage, ingressConfig, apiConfig, networkConfig, proxyNeeded)
+	if err != nil {
+		return haveDepl, current, fmt.Errorf("failed to build router deployment: %v", err)
 	}
-}
 
-func (r *reconciler) verifyCreateOrUpdateRouterDeployment(haveDepl bool, current, desired *appsv1.Deployment, ci *operatorv1.IngressController) (bool, *appsv1.Deployment, error) {
 	switch {
 	case !haveDepl:
 		if err := r.createRouterDeployment(desired); err != nil {
@@ -185,7 +173,7 @@ func HardStopAfterIsEnabled(ic *operatorv1.IngressController, ingressConfig *con
 }
 
 // desiredRouterDeployment returns the desired router deployment.
-func desiredRouterDeployment(haveErrorCodeCMInOpenShiftIngress bool, ci *operatorv1.IngressController, ingressControllerImage string, ingressConfig *configv1.Ingress, apiConfig *configv1.APIServer, networkConfig *configv1.Network, proxyNeeded bool) (*appsv1.Deployment, error) {
+func desiredRouterDeployment(ci *operatorv1.IngressController, ingressControllerImage string, ingressConfig *configv1.Ingress, apiConfig *configv1.APIServer, networkConfig *configv1.Network, proxyNeeded bool) (*appsv1.Deployment, error) {
 	deployment := manifests.RouterDeployment()
 	name := controller.RouterDeploymentName(ci)
 	deployment.Name = name.Name
@@ -370,27 +358,31 @@ func desiredRouterDeployment(haveErrorCodeCMInOpenShiftIngress bool, ci *operato
 	routerVolumeMounts = append(routerVolumeMounts, certsVolumeMount)
 
 	if len(ci.Spec.HttpErrorCodePages.Name) != 0 {
-		if haveErrorCodeCMInOpenShiftIngress {
-			configmapName := ci.Spec.HttpErrorCodePages.Name
-			httpErrorCodeConfigVolume := corev1.Volume{
-				Name: fmt.Sprintf("httperrorcodeconfigmap-volume-%s", ci.Spec.HttpErrorCodePages.Name),
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: configmapName,
-						},
+		configmapName := controller.HttpErrorCodePageConfigMapName(ci)
+		httpErrorCodeConfigVolume := corev1.Volume{
+			Name: "error-pages",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: configmapName.Name,
 					},
 				},
-			}
-			volumes = append(volumes, httpErrorCodeConfigVolume)
-			httpErrorCodeVolumeMount := corev1.VolumeMount{
-				Name:      httpErrorCodeConfigVolume.Name,
-				MountPath: "/var/lib/haproxy/conf/error_code_pages",
-			}
-			routerVolumeMounts = append(routerVolumeMounts, httpErrorCodeVolumeMount)
-			env = append(env, corev1.EnvVar{Name: "ERRORFILE_503", Value: "/var/lib/haproxy/conf/error_code_pages/error-page-503.http"})
-			env = append(env, corev1.EnvVar{Name: "ERRORFILE_404", Value: "/var/lib/haproxy/conf/error_code_pages/error-page-404.http"})
+			},
 		}
+		volumes = append(volumes, httpErrorCodeConfigVolume)
+		httpErrorCodeVolumeMount := corev1.VolumeMount{
+			Name:      httpErrorCodeConfigVolume.Name,
+			MountPath: "/var/lib/haproxy/conf/error_code_pages",
+		}
+		routerVolumeMounts = append(routerVolumeMounts, httpErrorCodeVolumeMount)
+		env = append(env, corev1.EnvVar{
+			Name:  "ERRORFILE_503",
+			Value: "/var/lib/haproxy/conf/error_code_pages/error-page-503.http",
+		})
+		env = append(env, corev1.EnvVar{
+			Name:  "ERRORFILE_404",
+			Value: "/var/lib/haproxy/conf/error_code_pages/error-page-404.http",
+		})
 	}
 
 	env = append(env, corev1.EnvVar{Name: "ROUTER_METRICS_TYPE", Value: "haproxy"})
@@ -1042,21 +1034,6 @@ func hashableProbe(probe *corev1.Probe) *corev1.Probe {
 	}
 
 	return &hashableProbe
-}
-
-// CurrentHttpErrorCodeConfigMap returns the current configmap.  Returns a
-// Boolean indicating whether the configmap existed, the configmap if it did
-// exist, and an error value.
-func (r *reconciler) currentHttpErrorCodeConfigMap(ic *operatorv1.IngressController, namespace string) (bool, *corev1.ConfigMap, error) {
-	cm := &corev1.ConfigMap{}
-	log.Info(fmt.Sprintf("currentHttpErrorCodeConfigMap IC %v", ic))
-	if err := r.client.Get(context.TODO(), controller.HttpErrorCodePageConfigMapName(ic, namespace), cm); err != nil {
-		if errors.IsNotFound(err) {
-			return false, nil, nil
-		}
-		return false, nil, err
-	}
-	return true, cm, nil
 }
 
 // currentRouterDeployment returns the current router deployment.

@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	appsv1 "k8s.io/api/apps/v1"
-	//"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
 	"regexp"
 	"strings"
 
@@ -32,10 +30,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
@@ -72,15 +68,12 @@ var (
 //
 // The controller will be pre-configured to watch for IngressController resources
 // in the manager namespace.
-func New(mgr manager.Manager, config Config, operandNamespace string, sourceConfigMapNamespace string) (controller.Controller, error) {
-	operatorCache := mgr.GetCache()
+func New(mgr manager.Manager, config Config) (controller.Controller, error) {
 	reconciler := &reconciler{
-		config:                   config,
-		client:                   mgr.GetClient(),
-		cache:                    mgr.GetCache(),
-		recorder:                 mgr.GetEventRecorderFor(controllerName),
-		operandNamespace:         operandNamespace,
-		sourceConfigMapNamespace: sourceConfigMapNamespace,
+		config:   config,
+		client:   mgr.GetClient(),
+		cache:    mgr.GetCache(),
+		recorder: mgr.GetEventRecorderFor(controllerName),
 	}
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: reconciler})
 	if err != nil {
@@ -101,89 +94,7 @@ func New(mgr manager.Manager, config Config, operandNamespace string, sourceConf
 	if err := c.Watch(&source.Kind{Type: &configv1.Ingress{}}, handler.EnqueueRequestsFromMapFunc(reconciler.ingressConfigToIngressController)); err != nil {
 		return nil, err
 	}
-	// Index ingresscontrollers over the httpErrorCodePage name so that
-	// configMapIsInUse and configMapToIngressController can look up
-	// ingresscontrollers that reference the secret.
-	if err := operatorCache.IndexField(context.Background(), &operatorv1.IngressController{}, "", func(o client.Object) []string {
-		configmapInOpenShiftConfig := operatorcontroller.HttpErrorCodePageConfigMapName(o.(*operatorv1.IngressController), sourceConfigMapNamespace)
-		configmapInOpenShiftIngress := operatorcontroller.HttpErrorCodePageConfigMapName(o.(*operatorv1.IngressController), operandNamespace)
-		return []string{configmapInOpenShiftConfig.Name, configmapInOpenShiftIngress.Name}
-	}); err != nil {
-		return nil, fmt.Errorf("failed to create index for ingresscontroller: %v", err)
-	}
-
-	configmapsInformerForOpenShiftConfigAndOpenShiftIngress, err := operatorCache.GetInformer(context.Background(), &corev1.ConfigMap{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create informer for configmaps: %v", err)
-	}
-	if err := c.Watch(&source.Informer{Informer: configmapsInformerForOpenShiftConfigAndOpenShiftIngress}, handler.EnqueueRequestsFromMapFunc(reconciler.configmapToIngressController), predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-		UpdateFunc:  func(e event.UpdateEvent) bool { return reconciler.configmapIsInUse(e.ObjectNew) },
-		GenericFunc: func(e event.GenericEvent) bool { return reconciler.configmapIsInUse(e.Object) },
-	}); err != nil {
-		return nil, err
-	}
 	return c, nil
-}
-
-// configmapToIngressController maps a secret to a slice of reconcile requests,
-// one request per ingresscontroller that references the configmap.
-func (r *reconciler) configmapToIngressController(o client.Object) []reconcile.Request {
-	requests := []reconcile.Request{}
-	controllers, err := r.ingressControllersWithConfigMap(o.GetName())
-	if err != nil {
-		log.Error(err, "failed to list ingresscontrollers for secret", "related", o.GetSelfLink())
-		return requests
-	}
-	for _, ic := range controllers {
-		log.Info("queueing ingresscontroller", "name", ic.Name, "related", o.GetSelfLink())
-		request := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: ic.Namespace,
-				Name:      ic.Name,
-			},
-		}
-		requests = append(requests, request)
-	}
-	return requests
-}
-
-// ingressControllersWithConfigMap returns the ingresscontrollers that reference
-// the given configmap.
-func (r *reconciler) ingressControllersWithConfigMap(configmapName string) ([]operatorv1.IngressController, error) {
-	controllers := &operatorv1.IngressControllerList{}
-	if err := r.cache.List(context.Background(), controllers); err != nil {
-		return nil, err
-	}
-
-	return controllers.Items, nil
-}
-
-// configmapIsInUse returns true if the given secret is referenced by some
-// ingresscontroller.
-func (r *reconciler) configmapIsInUse(o client.Object) bool {
-	controllers, err := r.ingressControllersWithConfigMap(o.GetName())
-	if err != nil {
-		log.Error(err, "failed to list ingresscontrollers for secret", "related", o.GetSelfLink())
-		return false
-	}
-	return len(controllers) > 0
-}
-
-// hasConfigMap returns true if the effective  httpErrorCodePage configmap for the
-// given ingresscontroller exists, false otherwise.
-func (r *reconciler) hasConfigMap(meta metav1.Object, o runtime.Object) bool {
-	ic := o.(*operatorv1.IngressController)
-	configMapName := operatorcontroller.HttpErrorCodePageConfigMapName(ic, r.operandNamespace)
-	configmap := &corev1.ConfigMap{}
-	if err := r.client.Get(context.Background(), configMapName, configmap); err != nil {
-		if errors.IsNotFound(err) {
-			return false
-		}
-		log.Error(err, "failed to look up secret for ingresscontroller", "name", configMapName, "related", meta.GetSelfLink())
-	}
-	return true
 }
 
 func (r *reconciler) ingressConfigToIngressController(o client.Object) []reconcile.Request {
@@ -235,12 +146,10 @@ type Config struct {
 // reconciler handles the actual ingress reconciliation logic in response to
 // events.
 type reconciler struct {
-	config                   Config
-	client                   client.Client
-	cache                    cache.Cache
-	recorder                 record.EventRecorder
-	operandNamespace         string
-	sourceConfigMapNamespace string
+	config   Config
+	client   client.Client
+	cache    cache.Cache
+	recorder record.EventRecorder
 }
 
 // admissionRejection is an error type for ingresscontroller admission
