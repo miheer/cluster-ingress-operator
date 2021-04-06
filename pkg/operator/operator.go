@@ -3,7 +3,7 @@ package operator
 import (
 	"context"
 	"fmt"
-	sync_http_error_code_configmap "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/sync-http-error-code-configmap"
+	errorpageconfigmapcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/sync-http-error-code-configmap"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -117,10 +117,10 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
 	}
 
 	// Set up the error-page configmap controller.
-	if _, err := sync_http_error_code_configmap.New(mgr, sync_http_error_code_configmap.Config{
-		OperatorNamespace:    config.Namespace,
-		SourceNamespace:      operatorcontroller.GlobalUserSpecifiedConfigNamespace,
-		DestinationNamespace: operatorcontroller.DefaultOperandNamespace,
+	if _, err := errorpageconfigmapcontroller.New(mgr, errorpageconfigmapcontroller.Config{
+		OperatorNamespace: config.Namespace,
+		ConfigNamespace:   operatorcontroller.GlobalUserSpecifiedConfigNamespace,
+		OperandNamespace:  operatorcontroller.DefaultOperandNamespace,
 	}); err != nil {
 		return nil, fmt.Errorf("failed to create error-page configmap controller: %w", err)
 	}
